@@ -1,0 +1,35 @@
+# EXAMPLE NanoDet config for single-class 'waybill'
+# Adjust paths under 'data' to your dataset.
+save_dir: ./workspace/waybill
+
+model:
+  name: nanodet-plus-m_320
+  num_classes: 1
+  activation: LeakyReLU
+
+data:
+  train:
+    name: coco
+    img_path: ../dataset/coco/images
+    ann_path: ../dataset/coco/train.json
+    input_size: [320, 320]
+  val:
+    name: coco
+    img_path: ../dataset/coco/images
+    ann_path: ../dataset/coco/val.json
+    input_size: [320, 320]
+
+schedule:
+  optimizer:
+    name: AdamW
+    lr: 0.0005
+    weight_decay: 0.01
+  total_epochs: 80
+  lr_schedule:
+    name: MultiStepLR
+    milestones: [50, 70]
+    gamma: 0.1
+  batch_size: 32
+  num_workers: 2
+
+device: cpu

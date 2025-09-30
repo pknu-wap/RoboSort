@@ -1,0 +1,11 @@
+opencv-python
+numpy
+pillow
+tqdm
+matplotlib
+pyyaml
+scikit-learn
+pycocotools-windows; platform_system == "Windows"
+pycocotools; platform_system != "Windows"
+pytesseract
+onnxruntime-directml

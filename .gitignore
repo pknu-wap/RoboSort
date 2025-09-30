@@ -1,0 +1,19 @@
+
+# Python & Virtual Environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+/venv/
+/.venv/
+
+# Datasets and Images
+/dataset/
+/images/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+
