@@ -5,12 +5,13 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
-/venv/
-/.venv/
+/venv310/
+/.venv310/
 
 # Datasets and Images
 /dataset/
 /images/
+/dataset_raw/
 
 # IDE and editor files
 .idea/
