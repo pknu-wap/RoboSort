@@ -5,7 +5,7 @@ import threading
 import time
 
 # EasyOCR 초기화
-reader = easyocr.Reader(['ko', 'en'], gpu=True)
+reader = easyocr.Reader(['ko', 'en'], gpu=False)
 
 # 카메라 열기
 cap = cv2.VideoCapture(0)

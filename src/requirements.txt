@@ -5,7 +5,7 @@ tqdm
 matplotlib
 pyyaml
 scikit-learn
-pycocotools-windows; platform_system == "Windows"
+pycocotools
 pycocotools; platform_system != "Windows"
 pytesseract
 onnxruntime-directml

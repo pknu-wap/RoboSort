@@ -1,6 +1,6 @@
 import cv2
 
-cap = cv2.VideoCapture(0)  # 카메라 인덱스 0~3 바꿔가며 테스트
+cap = cv2.VideoCapture(0)
 if not cap.isOpened():
     print("카메라를 열 수 없습니다.")
     exit()
