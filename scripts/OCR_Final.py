@@ -1,4 +1,3 @@
-# realtime_waybill_ocr_tesseract_fast.py
 import os
 
 import re
@@ -10,12 +9,14 @@ import argparse
 import numpy as np
 import uuid
 import shutil
+import json
+import threading
 import concurrent.futures as futures
 from collections import deque, Counter
 from typing import Tuple, Optional, List
-from nanodet.util import cfg, load_config, Logger
-from demo.demo import Predictor
-from rapidocr_onnxruntime import RapidOCR
+
+import serial
+import serial.tools.list_ports as list_ports
 
 # 경로 지정
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -24,6 +25,9 @@ nanodet_path = os.path.join(project_root, 'nanodet')
 if nanodet_path not in sys.path:
     sys.path.insert(0, nanodet_path)
 
+from nanodet.util import cfg, load_config, Logger
+from demo.demo import Predictor
+from rapidocr_onnxruntime import RapidOCR
 
 
 
@@ -37,6 +41,12 @@ DEFAULT_VOTE_MIN = 2 # 표결 최소 횟수
 
 CODE_REGEX = re.compile(r"\b\d{3}\s?[A-Z]\d{2}\b") # 운송장 번호 정규식
 ALLOWLIST = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ " # OCR 허용 문자
+
+# 오른쪽: 100,300,500,700,900 -> idx 0..4
+# 왼쪽 : 0,200,400,600,800   -> idx 0..4
+DEFAULT_RIGHT = [100, 300, 500, 700, 900]
+DEFAULT_LEFT  = [0, 200, 400, 600, 800]
+
 
 # matplotlib 뷰어
 class MatplotlibViewer:
@@ -339,6 +349,126 @@ def resize_for_detect(frame: np.ndarray, det_w: int):
     small = cv2.resize(frame, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
     return small, scale
 
+# ===================== 구역 매핑 & 시리얼 유틸 =====================
+def code_to_zone(code: str) -> Optional[int]:
+    """ '619 A02' -> 600 """
+    m = re.search(r"(\d{3})\s?[A-Z]\d{2}", code.upper())
+    if not m: return None
+    abc = int(m.group(1))
+    return (abc // 100) * 100
+
+def load_zone_map(path: Optional[str]) -> Tuple[List[int], List[int]]:
+    if not path: 
+        return DEFAULT_RIGHT[:], DEFAULT_LEFT[:]
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        right = list(map(int, data.get("RIGHT", DEFAULT_RIGHT)))
+        left  = list(map(int, data.get("LEFT",  DEFAULT_LEFT)))
+        return right, left
+    except Exception as e:
+        print(f"[WARN] zone_map load failed: {e}; using defaults.")
+        return DEFAULT_RIGHT[:], DEFAULT_LEFT[:]
+
+def zone_to_side_idx(zone: int, RIGHT: List[int], LEFT: List[int]) -> Tuple[Optional[str], Optional[int]]:
+    if zone in RIGHT: return 'R', RIGHT.index(zone)
+    if zone in LEFT:  return 'L', LEFT.index(zone)
+    return None, None
+
+def find_serial_port(prefer: Optional[str]=None) -> Optional[str]:
+    """ 사용 가능한 포트 탐색. prefer가 주어지면 먼저 사용 """
+    if prefer:
+        return prefer
+    ports = list_ports.comports()
+    # Arduino/ttyACM 계열 우선
+    for p in ports:
+        name = (p.device or "") + " " + (p.description or "")
+        if any(k in name for k in ("Arduino", "wchusb", "ttyACM", "ttyUSB", "COM")):
+            return p.device
+    # 아무거나 첫 번째
+    return ports[0].device if ports else None
+
+class SerialSender:
+    """ 아두이노로 명령 전송(R<idx>/L<idx>)
+        dup_policy:
+          - "handshake" : READY 또는 [STATE] IDLE 수신 시 last_sent 리셋(기본)
+          - "always"    : 항상 전송(중복 차단 없음)
+          - "block"     : 동일 명령 차단(이전 동작과 동일)
+    """
+    def __init__(self, port: Optional[str], baud: int, dup_policy: str = "handshake"):
+        self.port_name = find_serial_port(port)
+        self.baud = baud
+        self.ser = None
+        self.last_sent = None  # (side, idx)
+        self.dup_policy = dup_policy
+        self._stop_reader = False
+        self._reader_th: Optional[threading.Thread] = None
+
+        if self.port_name:
+            try:
+                self.ser = serial.Serial(self.port_name, self.baud, timeout=0.1)
+                time.sleep(1.5)  # Uno 리셋 대기
+                print(f"[INFO] Serial opened: {self.port_name} @ {self.baud}")
+                if self.dup_policy == "handshake":
+                    self._reader_th = threading.Thread(target=self._reader_loop, daemon=True)
+                    self._reader_th.start()
+            except Exception as e:
+                print(f"[WARN] Serial open failed ({self.port_name}): {e}")
+                self.ser = None
+        else:
+            print("[WARN] No serial port found. Running without sending.")
+
+    def _reader_loop(self):
+        buf = b""
+        while not self._stop_reader and self.ser is not None:
+            try:
+                line = self.ser.readline()
+                if not line:
+                    continue
+                text = line.decode("utf-8", errors="ignore").strip()
+                if text:
+                    # 아두이노가 찍는 로그를 그대로 패스스루
+                    print(f"[SER] {text}")
+                    # READY 또는 [STATE] IDLE 수신 시 중복 전송 허용을 위해 리셋
+                    if "READY" in text or "[STATE] IDLE" in text:
+                        self.last_sent = None
+            except Exception:
+                time.sleep(0.05)
+
+    def send(self, side: str, idx: int):
+        if side is None or idx is None:
+            return
+        if self.ser is None:
+            print(f"[SEND-DRY] {side}{idx}")
+            return
+
+        if self.dup_policy == "block":
+            if self.last_sent == (side, idx):
+                return
+        elif self.dup_policy == "handshake":
+            if self.last_sent == (side, idx):
+                # 아직 READY/IDLE 신호 못 받음 → 보류
+                return
+        # "always" 는 바로 전송
+
+        cmd = f"{side}{idx}\n".encode()
+        try:
+            self.ser.write(cmd)
+            self.ser.flush()
+            print(f"[SEND] {cmd!r} -> {self.port_name}")
+            self.last_sent = (side, idx)
+        except Exception as e:
+            print(f"[WARN] Serial send failed: {e}")
+
+    def close(self):
+        try:
+            self._stop_reader = True
+            if self._reader_th and self._reader_th.is_alive():
+                self._reader_th.join(timeout=0.2)
+            if self.ser: self.ser.close()
+        except Exception:
+            pass
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=r"C:\Workspace\Robosort\RoboSort\nanodet_waybill.yml")
@@ -351,9 +481,21 @@ def main():
     parser.add_argument("--debug_ocr", action="store_true")
     parser.add_argument("--save_rois", action="store_true")
     parser.add_argument("--vote_min", type=int, default=DEFAULT_VOTE_MIN)
-    args = parser.parse_args()
 
+    #시리얼/매핑 옵션
+    parser.add_argument("--serial_port", type=str, default=None, help="예: /dev/ttyACM0 또는 COM3 (미지정 시 자동)")
+    parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument("--zone_map", type=str, default=None, help="zones.json 경로(없으면 기본 매핑 사용)")
+    parser.add_argument("--dup_policy", type=str, default="handshake",
+                        choices=["handshake","always","block"],
+                        help="중복 명령 처리 정책 (기본 handshake: READY/[STATE] IDLE 수신 시 중복 허용)")
+
+    args = parser.parse_args()
     VOTE_MIN = args.vote_min
+
+    # 구역 매핑 로드
+    RIGHT, LEFT = load_zone_map(args.zone_map)
+    print(f"[MAP] RIGHT={RIGHT}  LEFT={LEFT}")
 
     # NanoDet
     load_config(cfg, args.config)
@@ -383,6 +525,9 @@ def main():
     if args.save_rois and not os.path.exists(save_dir):
         os.makedirs(save_dir, exist_ok=True)
 
+    sender = SerialSender(args.serial_port, args.baud, dup_policy=args.dup_policy)
+
+    print("[INFO] Press 'q' or close window to quit.")
     try:
         while True:
             ok, frame = cap.read()
@@ -433,12 +578,14 @@ def main():
                         last_ocr_t = now
                         prev_roi = roi.copy()
 
-            # 4) 결과 수거 + 즉시/연속/다수결
+            # 4) 결과 수거 + 즉시/연속/다수결 +  시리얼 전송
             if pending is not None and pending.done():
                 (code, immediate) = pending.result()
                 pending = None
                 if code:
                     code = canon(code)
+
+                    # === 콘솔 출력(기존 로직 유지) ===
                     if immediate:
                         print(code)
                         last_emitted = code
@@ -466,6 +613,19 @@ def main():
                                 last_emitted = common
                                 streak_code, streak_cnt = "", 0
 
+                    # === 전송: last_emitted 기준으로만 보냄 ===
+                    if last_emitted:
+                        zone = code_to_zone(last_emitted)
+                        if zone is not None:
+                            side, idx = zone_to_side_idx(zone, RIGHT, LEFT)
+                            if side is not None and idx is not None:
+                                # Arduino로 "R3\n" 또는 "L2\n" 전송
+                                sender.send(side, idx)
+                            else:
+                                print(f"[WARN] zone {zone} not in mapping (RIGHT/LEFT)")
+                        else:
+                            print("[WARN] code->zone failed:", last_emitted)
+
             # 5) 뷰
             if viewer is not None:
                 viewer.update(vis)
@@ -478,6 +638,7 @@ def main():
         if viewer is not None: viewer.close()
         try: cv2.destroyAllWindows()
         except: pass
+        sender.close()
 
 if __name__ == "__main__":
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
