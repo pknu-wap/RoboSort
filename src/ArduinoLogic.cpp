@@ -46,6 +46,8 @@
 #define R_IN1  12
 #define R_IN2  13
 
+// 서보모터 5, 6번핀
+
 const float d_set_right = 0.28; // 오른쪽 벽/물체로부터 "보통 주행" 시 유지하고 싶은 거리
 const float th_obj      = 0.10; // 스테이션 판정 임계(가까워짐). near = (distance < d_set_right - th_obj)
 const float d_near      = d_set_right - th_obj;

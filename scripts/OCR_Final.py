@@ -1,5 +1,4 @@
 import os
-
 import re
 import cv2
 import sys
@@ -28,7 +27,6 @@ if nanodet_path not in sys.path:
 from nanodet.util import cfg, load_config, Logger
 from demo.demo import Predictor
 from rapidocr_onnxruntime import RapidOCR
-
 
 
 DETECT_EVERY = 3        # 매 N 프레임마다 탐지
@@ -281,6 +279,8 @@ def split_three_chars(bin_img: np.ndarray) -> Optional[List[np.ndarray]]:
 
 def read_left_digits_strict(left_bin: np.ndarray) -> Optional[str]:
     # 운송장 번호의 첫 세 자리 숫자를 엄격한 기준으로 인식
+    if left_bin is None or left_bin.size == 0:
+        return None
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     left_bin = cv2.morphologyEx(left_bin, cv2.MORPH_CLOSE, k, iterations=1)
     chars = split_three_chars(left_bin)
@@ -307,6 +307,9 @@ def ocr_code_segmented(roi_bgr: np.ndarray, debug=False) -> Tuple[Optional[str],
         if not parts or len(parts) != 3:
             continue
         left, mid, right = parts
+
+        if left.size == 0 or mid.size == 0 or right.size == 0:
+            continue
 
         # 왼쪽 3자리: RapidOCR 글자별
         left_digits = read_left_digits_strict(left)
@@ -338,7 +341,7 @@ def ocr_code_segmented(roi_bgr: np.ndarray, debug=False) -> Tuple[Optional[str],
         cand = f"{m.group(1)} {m.group(2)}{m.group(3)}"
         if CODE_REGEX.fullmatch(cand):
             if debug: print(f"[DEBUG] fallback(rapid) -> {cand}")
-            return cand, False
+            return cand, True
     return None, False
 
 def resize_for_detect(frame: np.ndarray, det_w: int):
@@ -490,8 +493,17 @@ def main():
                         choices=["handshake","always","block"],
                         help="중복 명령 처리 정책 (기본 handshake: READY/[STATE] IDLE 수신 시 중복 허용)")
 
+    # === 좌우 반전 옵션 추가 ===
+    parser.add_argument("--hflip_input", action="store_true",
+                        help="입력 프레임을 좌우반전(처리와 표시 모두 반전된 영상 기준)")
+    parser.add_argument("--hflip_view", action="store_true",
+                        help="시각화만 좌우반전(내부 처리는 원본 기준)")
+
     args = parser.parse_args()
     VOTE_MIN = args.vote_min
+
+    if args.hflip_input and args.hflip_view:
+        print("[INFO] --hflip_input과 --hflip_view가 모두 켜짐 → 이중반전 방지를 위해 view 반전은 무시합니다.")
 
     # 구역 매핑 로드
     RIGHT, LEFT = load_zone_map(args.zone_map)
@@ -533,6 +545,10 @@ def main():
             ok, frame = cap.read()
             if not ok:
                 print("[WARN] camera read failed."); break
+
+            # === 입력 단계 좌우반전(처리/표시 모두 뒤집힌 영상 기준) ===
+            if args.hflip_input:
+                frame = cv2.flip(frame, 1)
 
             # 1) 탐지
             need_detect = (frame_idx % max(1, args.det_every) == 0) or (best_box is None)
@@ -628,7 +644,11 @@ def main():
 
             # 5) 뷰
             if viewer is not None:
-                viewer.update(vis)
+                # 시각화만 좌우반전: 입력 반전이 이미 적용되어 있으면 이중 반전 방지
+                vis_to_show = vis
+                if args.hflip_view and not args.hflip_input:
+                    vis_to_show = cv2.flip(vis, 1)
+                viewer.update(vis_to_show)
                 if viewer.stop: break
 
             frame_idx += 1
