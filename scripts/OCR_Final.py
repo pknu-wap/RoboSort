@@ -398,7 +398,7 @@ class SerialSender:
           - "always"    : 항상 전송(중복 차단 없음)
           - "block"     : 동일 명령 차단(이전 동작과 동일)
     """
-    def __init__(self, port: Optional[str], baud: int, dup_policy: str = "handshake"):
+    def __init__(self, port: Optional[str], baud: int, dup_policy: str = "handshake", disable_serial: bool = False):
         self.port_name = find_serial_port(port)
         self.baud = baud
         self.ser = None
@@ -406,6 +406,10 @@ class SerialSender:
         self.dup_policy = dup_policy
         self._stop_reader = False
         self._reader_th: Optional[threading.Thread] = None
+
+        if disable_serial:
+            print("[INFO] Serial communication is disabled by --disable_serial argument.")
+            return
 
         if self.port_name:
             try:
@@ -456,12 +460,16 @@ class SerialSender:
 
         cmd = f"{side}{idx}\n".encode()
         try:
+            if self.ser is None: # 추가된 확인
+                print(f"[WARN] Serial port not available. Cannot send {cmd!r}.")
+                return
             self.ser.write(cmd)
             self.ser.flush()
             print(f"[SEND] {cmd!r} -> {self.port_name}")
             self.last_sent = (side, idx)
         except Exception as e:
             print(f"[WARN] Serial send failed: {e}")
+            self.ser = None # 오류 발생 시 시리얼 객체를 None으로 설정하여 추가 시도 방지
 
     def close(self):
         try:
@@ -474,16 +482,13 @@ class SerialSender:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=r"C:\Workspace\Robosort\RoboSort\nanodet_waybill.yml")
-    parser.add_argument("--model",  default=r"C:\Workspace\Robosort\RoboSort\nanodet\workspace\waybill\model_last.ckpt")
+    parser.add_argument("--config", default=os.path.join(project_root, "nanodet_waybill.yml"))
+    parser.add_argument("--model",  default=os.path.join(project_root, "nanodet", "workspace", "waybill", "model_last.ckpt"))
     parser.add_argument("--camid", type=int, default=0)
     parser.add_argument("--conf",  type=float, default=0.35)
     parser.add_argument("--show", action="store_true")
-    parser.add_argument("--det_every", type=int, default=DETECT_EVERY)
-    parser.add_argument("--det_width", type=int, default=DETECT_WIDTH)
     parser.add_argument("--debug_ocr", action="store_true")
     parser.add_argument("--save_rois", action="store_true")
-    parser.add_argument("--vote_min", type=int, default=DEFAULT_VOTE_MIN)
 
     #시리얼/매핑 옵션
     parser.add_argument("--serial_port", type=str, default=None, help="예: /dev/ttyACM0 또는 COM3 (미지정 시 자동)")
@@ -492,6 +497,8 @@ def main():
     parser.add_argument("--dup_policy", type=str, default="handshake",
                         choices=["handshake","always","block"],
                         help="중복 명령 처리 정책 (기본 handshake: READY/[STATE] IDLE 수신 시 중복 허용)")
+    parser.add_argument("--disable_serial", action="store_true",
+                        help="시리얼 통신을 비활성화하여 시리얼 포트 관련 문제를 방지합니다.")
 
     # === 좌우 반전 옵션 추가 ===
     parser.add_argument("--hflip_input", action="store_true",
@@ -500,10 +507,7 @@ def main():
                         help="시각화만 좌우반전(내부 처리는 원본 기준)")
 
     args = parser.parse_args()
-    VOTE_MIN = args.vote_min
-
-    if args.hflip_input and args.hflip_view:
-        print("[INFO] --hflip_input과 --hflip_view가 모두 켜짐 → 이중반전 방지를 위해 view 반전은 무시합니다.")
+    VOTE_MIN = DEFAULT_VOTE_MIN # VOTE_MIN 초기화 추가
 
     # 구역 매핑 로드
     RIGHT, LEFT = load_zone_map(args.zone_map)
@@ -537,7 +541,7 @@ def main():
     if args.save_rois and not os.path.exists(save_dir):
         os.makedirs(save_dir, exist_ok=True)
 
-    sender = SerialSender(args.serial_port, args.baud, dup_policy=args.dup_policy)
+    sender = SerialSender(args.serial_port, args.baud, dup_policy=args.dup_policy, disable_serial=args.disable_serial)
 
     print("[INFO] Press 'q' or close window to quit.")
     try:
@@ -551,10 +555,10 @@ def main():
                 frame = cv2.flip(frame, 1)
 
             # 1) 탐지
-            need_detect = (frame_idx % max(1, args.det_every) == 0) or (best_box is None)
+            need_detect = (frame_idx % max(1, DETECT_EVERY) == 0) or (best_box is None)
             vis = frame
             if need_detect:
-                det_img, scale = resize_for_detect(frame, args.det_width)
+                det_img, scale = resize_for_detect(frame, DETECT_WIDTH)
                 meta, res = predictor.inference(det_img)
                 boxes = extract_boxes(res[0])
                 chosen = None
