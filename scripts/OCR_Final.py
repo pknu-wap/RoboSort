@@ -6,8 +6,6 @@ import time
 import torch
 import argparse
 import numpy as np
-import uuid
-import shutil
 import json
 import threading
 import concurrent.futures as futures
@@ -17,37 +15,42 @@ from typing import Tuple, Optional, List
 import serial
 import serial.tools.list_ports as list_ports
 
-# 경로 지정
+DETECT_EVERY = 3        # 매 N 프레임마다 탐지
+DETECT_WIDTH = 640      # 탐지용 축소 너비
+OCR_MIN_INTERVAL = 0.25 # OCR 최소 간격(초)
+ROI_DIFF_THRESH = 6.0   # ROI 변동 감지 임계값
+TOP_BAND_RATIO = 0.55   # ROI 상단 몇 % 영역 OCR
+VOTE_LEN = 7            # 표결 버퍼 길이
+DEFAULT_VOTE_MIN = 2    # 표결 최소 횟수
+CONF_THRESH = 0.30      # 탐지 score 임계값
+BAUD_RATE = 9600        # 시리얼 보드레이트 (아두이노 스케치와 동일)
+
+# NanoDet 경로
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
+DEFAULT_CONFIG_PATH = os.path.join(project_root, "nanodet_waybill.yml")
+DEFAULT_MODEL_PATH  = os.path.join(project_root, "nanodet", "workspace", "waybill", "model_last.ckpt")
+
+CODE_REGEX = re.compile(r"\b\d{3}\s?[A-Z]\d{2}\b")  # 운송장 번호 정규식
+ALLOWLIST = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ " # OCR 허용 문자
+
+# 회전 OCR
+ROT_BASE_ANGLES  = [0.0, 180.0]               # 1차 시도
+ROT_EXTRA_ANGLES = [90.0, -90.0, 45.0, -45.0] # 2차(품질 낮을 때만)
+ROT_SCORE_THR    = 0.65                        # 평균 스코어 임계값(보팅 후보 허용)
+IMMEDIATE_SCORE_THR = 0.90                     # 평균 스코어 임계값(즉시 확정 & 전송)
+
+# 경로 지정 (원 코드 유지)
 nanodet_path = os.path.join(project_root, 'nanodet')
 if nanodet_path not in sys.path:
     sys.path.insert(0, nanodet_path)
 
 from nanodet.util import cfg, load_config, Logger
 from demo.demo import Predictor
-from rapidocr_onnxruntime import RapidOCR
+import rapidocr_onnxruntime
 
-
-DETECT_EVERY = 3        # 매 N 프레임마다 탐지
-DETECT_WIDTH = 640     # 탐지용 축소 너비
-OCR_MIN_INTERVAL = 0.25 # OCR 최소 간격(초)
-ROI_DIFF_THRESH = 6.0 # ROI 변동 감지 임계값
-TOP_BAND_RATIO = 0.55 # ROI 상단 몇 % 영역 OCR
-VOTE_LEN = 7         # 표결 버퍼 길이
-DEFAULT_VOTE_MIN = 2 # 표결 최소 횟수
-
-CODE_REGEX = re.compile(r"\b\d{3}\s?[A-Z]\d{2}\b") # 운송장 번호 정규식
-ALLOWLIST = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ " # OCR 허용 문자
-
-# 오른쪽: 100,300,500,700,900 -> idx 0..4
-# 왼쪽 : 0,200,400,600,800   -> idx 0..4
-DEFAULT_RIGHT = [100, 300, 500, 700, 900]
-DEFAULT_LEFT  = [0, 200, 400, 600, 800]
-
-
-# matplotlib 뷰어
 class MatplotlibViewer:
+    """OpenCV imshow 대신 Matplotlib로 프레임 표시"""
     def __init__(self, title="RoboSort - Waybill OCR"):
         import matplotlib
         try:
@@ -85,8 +88,8 @@ class MatplotlibViewer:
         except Exception: pass
         self.plt.ioff(); self.plt.close(self.fig)
 
+# ----------------------- 전처리/유틸 -----------------------
 def preprocess_otsu(bgr: np.ndarray) -> np.ndarray:
-    # Otsu 이진화를 사용한 이미지 전처리
     h, w = bgr.shape[:2]
     if max(h, w) < 320:
         bgr = cv2.resize(bgr, (w*2, h*2), interpolation=cv2.INTER_CUBIC)
@@ -97,7 +100,6 @@ def preprocess_otsu(bgr: np.ndarray) -> np.ndarray:
     return cv2.morphologyEx(th, cv2.MORPH_OPEN, k, iterations=1)
 
 def preprocess_adaptive(bgr: np.ndarray) -> np.ndarray:
-    # 적응형 스레시홀딩을 사용한 이미지 전처리
     h, w = bgr.shape[:2]
     if max(h, w) < 320:
         bgr = cv2.resize(bgr, (w*2, h*2), interpolation=cv2.INTER_CUBIC)
@@ -106,11 +108,9 @@ def preprocess_adaptive(bgr: np.ndarray) -> np.ndarray:
                                  cv2.THRESH_BINARY, 31, 10)
 
 def maybe_invert(bin_img: np.ndarray) -> np.ndarray:
-    # 글자보다 배경이 밝은 경우 이미지 반전
     return cv2.bitwise_not(bin_img) if (bin_img > 127).mean() < 0.45 else bin_img
 
 def clamp_box(x1, y1, x2, y2, w, h, margin_ratio=0.05):
-    # 바운딩 박스가 이미지 경계를 벗어나지 않도록 좌표 조정
     bw, bh = x2 - x1, y2 - y1
     mx = int(bw * margin_ratio); my = int(bh * margin_ratio)
     x1 = max(0, x1 - mx); y1 = max(0, y1 - my)
@@ -118,7 +118,6 @@ def clamp_box(x1, y1, x2, y2, w, h, margin_ratio=0.05):
     return x1, y1, x2, y2
 
 def roi_changed(prev: Optional[np.ndarray], cur: np.ndarray, thresh: float = ROI_DIFF_THRESH) -> bool:
-    # 이전 ROI와 현재 ROI를 비교하여 변화 여부 확인
     if prev is None or prev.size == 0: return True
     a = cv2.resize(prev, (160, 80)); b = cv2.resize(cur, (160, 80))
     if a.ndim == 3: a = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
@@ -126,17 +125,14 @@ def roi_changed(prev: Optional[np.ndarray], cur: np.ndarray, thresh: float = ROI
     return float(cv2.absdiff(a, b).mean()) > thresh
 
 def crop_top_band(roi_bgr: np.ndarray, ratio: float = TOP_BAND_RATIO) -> np.ndarray:
-    # ROI이미지의 상단 일부 영역(운송장 번호가 있을 가능성이 높은) 재단.
     h = roi_bgr.shape[0]; hh = max(10, int(h * ratio))
     return roi_bgr[:hh, :]
 
 def canon(code: str) -> str:
-    # 인식된 운송장 번호 문자열의 정규화.
     return re.sub(r"\s+", " ", code.strip().upper())
 
 # ================= NanoDet 결과 파싱 =================
 def extract_boxes(nanodet_result) -> List[Tuple[float, int, int, int, int]]:
-    # NanoDet 모델 출력 결과에서 바운딩 박스목록 추출.
     boxes = []
     r = nanodet_result
     try:
@@ -165,7 +161,6 @@ def extract_boxes(nanodet_result) -> List[Tuple[float, int, int, int, int]]:
 
 # ================= 밴드/토큰 분리 =================
 def pick_text_band(bin_img: np.ndarray) -> np.ndarray:
-    # 수평 투영을 이용한 주요 텍스트 밴드 추출.
     black = (bin_img < 128).astype(np.uint8)
     proj = black.mean(axis=1)
     k = max(3, bin_img.shape[0] // 80)
@@ -180,15 +175,14 @@ def pick_text_band(bin_img: np.ndarray) -> np.ndarray:
     pad = max(2, (y2 - y1)//6)
     y1 = max(0, y1 - pad); y2 = min(bin_img.shape[0]-1, y2 + pad)
     return bin_img[y1:y2+1, :]
+
 def trim_lr(img: np.ndarray) -> np.ndarray:
-    # 이미지 좌우의 불필요한 공백 제거
     col = (img < 128).mean(axis=0)
     nz = np.where(col > 0.02)[0]
     if nz.size == 0: return img
     return img[:, nz[0]:nz[-1]+1]
 
 def split_letter_digits_cut(token: np.ndarray) -> Optional[int]:
-    # 문자와 숫자 부분을 분리하기 위한 최적의 수직 분할 지점 탐색
     black = (token < 128).astype(np.uint8)
     proj = black.mean(axis=0); W = token.shape[1]
     if W < 10: return None
@@ -200,7 +194,6 @@ def split_letter_digits_cut(token: np.ndarray) -> Optional[int]:
     return cut
 
 def split_by_spaces(bin_band: np.ndarray) -> Optional[List[np.ndarray]]:
-    # 수직 투영을 이용해 공백 기준으로 텍스트 밴드를 여러 토큰으로 분할
     black = (bin_band < 128).astype(np.uint8)
     proj = black.mean(axis=0)
     th = max(0.03, float(proj.mean() * 0.5))
@@ -215,7 +208,6 @@ def split_by_spaces(bin_band: np.ndarray) -> Optional[List[np.ndarray]]:
         c2 = (g[1][0] + g[1][1]) // 2
         a = bin_band[:, :c1]; b = bin_band[:, c1:c2]; c = bin_band[:, c2:]
         return [trim_lr(a), trim_lr(b), trim_lr(c)]
-    # 공백 1개 → 오른쪽을 문자/숫자로 추가 분할
     g0 = (int(gaps[0][0]), int(gaps[0][-1]))
     cmid = (g0[0] + g0[1]) // 2
     left = trim_lr(bin_band[:, :cmid]); right = trim_lr(bin_band[:, cmid:])
@@ -223,46 +215,73 @@ def split_by_spaces(bin_band: np.ndarray) -> Optional[List[np.ndarray]]:
     if cut is None: return None
     return [left, trim_lr(right[:, :cut]), trim_lr(right[:, cut:])]
 
-# ================= RapidOCR 래퍼 =================
+# ---------------- RapidOCR 모델 경로 -----------------
+try:
+    rapidocr_dir = os.path.dirname(rapidocr_onnxruntime.__file__)
+    det_model_path = os.path.join(rapidocr_dir, "models", "ch_PP-OCRv4_det_infer.onnx")
+    rec_model_path = os.path.join(rapidocr_dir, "models", "ch_PP-OCRv4_rec_infer.onnx")
+    cls_model_path = os.path.join(rapidocr_dir, "models", "ch_ppocr_mobile_v2.0_cls_infer.onnx")
+    if not all(os.path.exists(p) for p in [det_model_path, rec_model_path, cls_model_path]):
+        print("[WARN] Default ONNX models not found in rapidocr_onnxruntime package.")
+        det_model_path, rec_model_path, cls_model_path = None, None, None
+except (ImportError, AttributeError):
+    print("[WARN] rapidocr_onnxruntime not found or `__file__` not available.")
+    det_model_path, rec_model_path, cls_model_path = None, None, None
+
 class RapidRec:
-    # RapidOCR 모델을 감싸 텍스트 인식을 수행하는 래퍼(Wrapper) 클래스
     def __init__(self):
-        # lite 모델 기본, 영어 dict. 필요 시 모델 경로 인자로 바꿀 수 있음
-        self.ocr = RapidOCR(rec_score_threshold=0.1)  # 낮게 잡고 후단에서 정규식/보팅
+        if det_model_path and rec_model_path and cls_model_path:
+            self.ocr = rapidocr_onnxruntime.RapidOCR(
+                det_model_path=det_model_path,
+                rec_model_path=rec_model_path,
+                cls_model_path=cls_model_path,
+                rec_score_threshold=0.1
+            )
+        else:
+            self.ocr = rapidocr_onnxruntime.RapidOCR(rec_score_threshold=0.1)
+
     def _run(self, img: np.ndarray, allow: str) -> Tuple[str, float]:
-        # use_det=False로 "한 덩어리" 인식
         res, _ = self.ocr(img, use_det=False, use_cls=True)
         txt, score = "", 0.0
         try:
             if isinstance(res, list) and len(res) > 0:
                 item = res[0]
                 if isinstance(item, (list, tuple)):
-                    # 형태 1: ['TEXT', 0.98]
                     if len(item) == 2 and isinstance(item[0], str):
                         txt, score = item[0], float(item[1])
-                    # 형태 2: [[box], 'TEXT', 0.98]
                     elif len(item) >= 3 and isinstance(item[1], str):
                         txt, score = item[1], float(item[2])
         except Exception:
             pass
-        # 화이트리스트 정리
-        txt = "".join(ch for ch in txt.upper() if ch in allow)
+        txt = "".join(ch for ch in txt.upper() if ch in ALLOWLIST)
         return txt, float(score)
+
     def digits(self, img: np.ndarray) -> str:
-        t, _ = self._run(img, "0123456789")
-        return t
+        t, _ = self._run(img, "0123456789"); return t
+
     def letters(self, img: np.ndarray) -> str:
-        t, _ = self._run(img, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-        return t
+        t, _ = self._run(img, "ABCDEFGHIJKLMNOPQRSTUVWXYZ"); return t
+
     def any_en(self, img: np.ndarray) -> str:
-        t, _ = self._run(img, ALLOWLIST)
-        return t
+        t, _ = self._run(img, ALLOWLIST); return t
+
+    def detect_full(self, img: np.ndarray) -> List[Tuple[str, float]]:
+        out: List[Tuple[str, float]] = []
+        try:
+            res, _ = self.ocr(img, use_det=True, use_cls=True)
+            for item in (res or []):
+                if isinstance(item, (list, tuple)) and len(item) >= 3 and isinstance(item[1], str):
+                    txt = "".join(ch for ch in item[1].upper() if ch in ALLOWLIST)
+                    if txt:
+                        out.append((txt, float(item[2])))
+        except Exception:
+            pass
+        return out
 
 rapid = RapidRec()  # 전역 하나로 재사용(워밍업됨)
 
-# 왼쪽 3자리 분할(강화) → RapidOCR로 글자별 인식
+# ---------------- OCR 세부 ----------------
 def split_three_chars(bin_img: np.ndarray) -> Optional[List[np.ndarray]]:
-    # 이미지에 포함된 세 개의 글자를 각각의 이미지로 분할
     black = (bin_img < 128).astype(np.uint8)
     proj = black.mean(axis=0); W = bin_img.shape[1]
     if W < 24: return None
@@ -278,7 +297,6 @@ def split_three_chars(bin_img: np.ndarray) -> Optional[List[np.ndarray]]:
     return [a, b, c]
 
 def read_left_digits_strict(left_bin: np.ndarray) -> Optional[str]:
-    # 운송장 번호의 첫 세 자리 숫자를 엄격한 기준으로 인식
     if left_bin is None or left_bin.size == 0:
         return None
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
@@ -293,7 +311,6 @@ def read_left_digits_strict(left_bin: np.ndarray) -> Optional[str]:
     return "".join(out)
 
 def ocr_code_segmented(roi_bgr: np.ndarray, debug=False) -> Tuple[Optional[str], bool]:
-    # 분할 기반 OCR을 수행하여 운송장 번호 인식
     if roi_bgr is None or roi_bgr.size == 0:
         return None, False
     head = crop_top_band(roi_bgr, TOP_BAND_RATIO)
@@ -307,15 +324,12 @@ def ocr_code_segmented(roi_bgr: np.ndarray, debug=False) -> Tuple[Optional[str],
         if not parts or len(parts) != 3:
             continue
         left, mid, right = parts
-
         if left.size == 0 or mid.size == 0 or right.size == 0:
             continue
 
-        # 왼쪽 3자리: RapidOCR 글자별
         left_digits = read_left_digits_strict(left)
         strict_ok = left_digits is not None and len(left_digits) >= 3
         if not strict_ok:
-            # 토큰 단위 보정
             left_digits = rapid.digits(left)[:3]
         if not left_digits or len(left_digits) < 3:
             continue
@@ -331,9 +345,9 @@ def ocr_code_segmented(roi_bgr: np.ndarray, debug=False) -> Tuple[Optional[str],
         cand = f"{left_digits[:3]} {mid_char[0]}{right_digits[:2]}"
         if CODE_REGEX.fullmatch(cand):
             if debug: print(f"[DEBUG] segmented(rapid) -> {cand} (strict={strict_ok})")
-            return cand, bool(strict_ok)
+            return cand, True  # 분할 성공은 즉시 확정
 
-    #전체 한 번 읽고 정규화
+    # 전체 한 번 읽고 정규화(폴백)
     merged = rapid.any_en(head)
     s = canon(merged)
     m = re.search(r"(\d{3})\s*([A-Z])\s*(\d{2})", s)
@@ -341,74 +355,133 @@ def ocr_code_segmented(roi_bgr: np.ndarray, debug=False) -> Tuple[Optional[str],
         cand = f"{m.group(1)} {m.group(2)}{m.group(3)}"
         if CODE_REGEX.fullmatch(cand):
             if debug: print(f"[DEBUG] fallback(rapid) -> {cand}")
-            return cand, True
+            return cand, False
+    return None, False
+
+# -------------------- 회전 유틸/로직 --------------------
+def rotate_bound(img: np.ndarray, angle_deg: float) -> np.ndarray:
+    if angle_deg % 360 == 0:
+        return img
+    (h, w) = img.shape[:2]
+    cX, cY = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D((cX, cY), angle_deg, 1.0)
+    cos = abs(M[0, 0]); sin = abs(M[0, 1])
+    nW = int((h * sin) + (w * cos))
+    nH = int((h * cos) + (w * sin))
+    M[0, 2] += (nW / 2) - cX
+    M[1, 2] += (nH / 2) - cY
+    return cv2.warpAffine(img, M, (nW, nH), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+def ocr_code_rotation_adaptive(
+    roi_bgr: np.ndarray,
+    debug: bool = False,
+    base_angles: Optional[List[float]] = None,
+    extra_angles: Optional[List[float]] = None,
+    score_thr: float = ROT_SCORE_THR,
+    immediate_thr: float = IMMEDIATE_SCORE_THR,
+) -> Tuple[Optional[str], bool]:
+    """
+    1) base_angles(기본 0,180)에서 분할식 우선 → 성공 시 즉시(True)
+    2) base_angles에서 검출 기반 평균 스코어 계산:
+       - mean >= immediate_thr → 즉시 확정(True)
+       - mean >= score_thr     → 보팅 후보(False)
+    3) 품질 낮으면 extra 각도(90,-90,±45)에서 동일 로직
+    """
+    base_angles = base_angles or ROT_BASE_ANGLES
+    extra_angles = extra_angles or ROT_EXTRA_ANGLES
+
+    # 1) base에서 분할식 → 성공 시 즉시
+    for ang in base_angles:
+        img = roi_bgr if ang == 0.0 else rotate_bound(roi_bgr, ang)
+        code, immediate = ocr_code_segmented(img, debug)
+        if code:
+            return code, True  # 분할 성공은 즉시
+
+    # 1-b) base에서 검출 기반
+    best_cand, best_score = None, -1.0
+    for ang in base_angles:
+        img = roi_bgr if ang == 0.0 else rotate_bound(roi_bgr, ang)
+        items = rapid.detect_full(img)
+        if not items:
+            continue
+        combined = " ".join([t for (t, s) in items])
+        s = canon(combined)
+        m = re.search(r"(\d{3})\s*([A-Z])\s*(\d{2})", s)
+        if m:
+            cand = f"{m.group(1)} {m.group(2)}{m.group(3)}"
+            mean_score = float(np.mean([s for (_, s) in items]))
+            if debug:
+                print(f"[DEBUG] base{ang:+.0f} -> {cand} (mean={mean_score:.3f})")
+            if mean_score >= immediate_thr:
+                return cand, True
+            if mean_score > best_score:
+                best_score, best_cand = mean_score, cand
+
+    if best_cand and best_score >= score_thr:
+        return best_cand, False
+
+    # 2) extra 각도
+    best_cand2, best_score2 = None, -1.0
+    for ang in extra_angles:
+        img = rotate_bound(roi_bgr, ang)
+        items = rapid.detect_full(img)
+        if not items:
+            continue
+        combined = " ".join([t for (t, s) in items])
+        s = canon(combined)
+        m = re.search(r"(\d{3})\s*([A-Z])\s*(\d{2})", s)
+        if m:
+            cand = f"{m.group(1)} {m.group(2)}{m.group(3)}"
+            mean_score = float(np.mean([s for (_, s) in items]))
+            if debug:
+                print(f"[DEBUG] extra{ang:+.0f} -> {cand} (mean={mean_score:.3f})")
+            if mean_score >= immediate_thr:
+                return cand, True
+            if mean_score > best_score2:
+                best_score2, best_cand2 = mean_score, cand
+
+    if best_cand2:
+        return best_cand2, False
     return None, False
 
 def resize_for_detect(frame: np.ndarray, det_w: int):
-    # 객체 탐지를 수행하기 전 프레임 크기 조정.
     h, w = frame.shape[:2]
     if w <= det_w: return frame, 1.0
     scale = det_w / float(w)
     small = cv2.resize(frame, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
     return small, scale
 
-# ===================== 구역 매핑 & 시리얼 유틸 =====================
+# ===================== 구역/시리얼 유틸 =====================
 def code_to_zone(code: str) -> Optional[int]:
-    """ '619 A02' -> 600 """
+    """ '619 A02' -> 600  (앞 3자리의 백의 자리로 내림 ×100) """
     m = re.search(r"(\d{3})\s?[A-Z]\d{2}", code.upper())
     if not m: return None
     abc = int(m.group(1))
     return (abc // 100) * 100
 
-def load_zone_map(path: Optional[str]) -> Tuple[List[int], List[int]]:
-    if not path: 
-        return DEFAULT_RIGHT[:], DEFAULT_LEFT[:]
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        right = list(map(int, data.get("RIGHT", DEFAULT_RIGHT)))
-        left  = list(map(int, data.get("LEFT",  DEFAULT_LEFT)))
-        return right, left
-    except Exception as e:
-        print(f"[WARN] zone_map load failed: {e}; using defaults.")
-        return DEFAULT_RIGHT[:], DEFAULT_LEFT[:]
-
-def zone_to_side_idx(zone: int, RIGHT: List[int], LEFT: List[int]) -> Tuple[Optional[str], Optional[int]]:
-    if zone in RIGHT: return 'R', RIGHT.index(zone)
-    if zone in LEFT:  return 'L', LEFT.index(zone)
-    return None, None
-
 def find_serial_port(prefer: Optional[str]=None) -> Optional[str]:
-    """ 사용 가능한 포트 탐색. prefer가 주어지면 먼저 사용 """
     if prefer:
         return prefer
     ports = list_ports.comports()
-    # Arduino/ttyACM 계열 우선
     for p in ports:
         name = (p.device or "") + " " + (p.description or "")
         if any(k in name for k in ("Arduino", "wchusb", "ttyACM", "ttyUSB", "COM")):
             return p.device
-    # 아무거나 첫 번째
     return ports[0].device if ports else None
 
 class SerialSender:
-    """ 아두이노로 명령 전송(R<idx>/L<idx>)
-        dup_policy:
-          - "handshake" : READY 또는 [STATE] IDLE 수신 시 last_sent 리셋(기본)
-          - "always"    : 항상 전송(중복 차단 없음)
-          - "block"     : 동일 명령 차단(이전 동작과 동일)
-    """
+    """ 아두이노로 '세 자리 코드(예: 900, 500, 600...)' 전송 """
     def __init__(self, port: Optional[str], baud: int, dup_policy: str = "handshake", disable_serial: bool = False):
         self.port_name = find_serial_port(port)
         self.baud = baud
         self.ser = None
-        self.last_sent = None  # (side, idx)
+        self.last_sent = None 
         self.dup_policy = dup_policy
         self._stop_reader = False
         self._reader_th: Optional[threading.Thread] = None
 
         if disable_serial:
-            print("[INFO] Serial communication is disabled by --disable_serial argument.")
+            print("[INFO] Serial communication is disabled by --disable_serial.")
             return
 
         if self.port_name:
@@ -426,7 +499,6 @@ class SerialSender:
             print("[WARN] No serial port found. Running without sending.")
 
     def _reader_loop(self):
-        buf = b""
         while not self._stop_reader and self.ser is not None:
             try:
                 line = self.ser.readline()
@@ -434,42 +506,34 @@ class SerialSender:
                     continue
                 text = line.decode("utf-8", errors="ignore").strip()
                 if text:
-                    # 아두이노가 찍는 로그를 그대로 패스스루
                     print(f"[SER] {text}")
-                    # READY 또는 [STATE] IDLE 수신 시 중복 전송 허용을 위해 리셋
                     if "READY" in text or "[STATE] IDLE" in text:
                         self.last_sent = None
             except Exception:
                 time.sleep(0.05)
 
-    def send(self, side: str, idx: int):
-        if side is None or idx is None:
+    def send_code(self, code: int):
+        """ 세 자리 정수 코드를 전송 """
+        if code is None:
             return
         if self.ser is None:
-            print(f"[SEND-DRY] {side}{idx}")
+            print(f"[SEND-DRY] {code}")
             return
 
-        if self.dup_policy == "block":
-            if self.last_sent == (side, idx):
-                return
-        elif self.dup_policy == "handshake":
-            if self.last_sent == (side, idx):
-                # 아직 READY/IDLE 신호 못 받음 → 보류
-                return
-        # "always" 는 바로 전송
+        if self.dup_policy == "block" and self.last_sent == code:
+            return
+        if self.dup_policy == "handshake" and self.last_sent == code:
+            return
 
-        cmd = f"{side}{idx}\n".encode()
+        line = f"{int(code)}\n".encode()
         try:
-            if self.ser is None: # 추가된 확인
-                print(f"[WARN] Serial port not available. Cannot send {cmd!r}.")
-                return
-            self.ser.write(cmd)
+            self.ser.write(line)
             self.ser.flush()
-            print(f"[SEND] {cmd!r} -> {self.port_name}")
-            self.last_sent = (side, idx)
+            print(f"[SEND] {line!r} -> {self.port_name}")
+            self.last_sent = int(code)
         except Exception as e:
             print(f"[WARN] Serial send failed: {e}")
-            self.ser = None # 오류 발생 시 시리얼 객체를 None으로 설정하여 추가 시도 방지
+            self.ser = None
 
     def close(self):
         try:
@@ -480,44 +544,49 @@ class SerialSender:
         except Exception:
             pass
 
+# ---------------------- OCR 로직 ----------------------
+def ocr_with_rotation(roi_bgr: np.ndarray, debug: bool, rot_disabled: bool) -> Tuple[Optional[str], bool]:
+    if rot_disabled:
+        return ocr_code_segmented(roi_bgr, debug)
+    else:
+        return ocr_code_rotation_adaptive(
+            roi_bgr, debug,
+            base_angles=ROT_BASE_ANGLES,
+            extra_angles=ROT_EXTRA_ANGLES,
+            score_thr=ROT_SCORE_THR,
+            immediate_thr=IMMEDIATE_SCORE_THR
+        )
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=os.path.join(project_root, "nanodet_waybill.yml"))
-    parser.add_argument("--model",  default=os.path.join(project_root, "nanodet", "workspace", "waybill", "model_last.ckpt"))
     parser.add_argument("--camid", type=int, default=0)
-    parser.add_argument("--conf",  type=float, default=0.35)
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--debug_ocr", action="store_true")
-    parser.add_argument("--save_rois", action="store_true")
 
-    #시리얼/매핑 옵션
+    # 시리얼 관련
     parser.add_argument("--serial_port", type=str, default=None, help="예: /dev/ttyACM0 또는 COM3 (미지정 시 자동)")
-    parser.add_argument("--baud", type=int, default=115200)
-    parser.add_argument("--zone_map", type=str, default=None, help="zones.json 경로(없으면 기본 매핑 사용)")
     parser.add_argument("--dup_policy", type=str, default="handshake",
                         choices=["handshake","always","block"],
                         help="중복 명령 처리 정책 (기본 handshake: READY/[STATE] IDLE 수신 시 중복 허용)")
     parser.add_argument("--disable_serial", action="store_true",
-                        help="시리얼 통신을 비활성화하여 시리얼 포트 관련 문제를 방지합니다.")
+                        help="시리얼 통신 비활성화(로그만 출력)")
 
-    # === 좌우 반전 옵션 추가 ===
+    # 영상 처리
     parser.add_argument("--hflip_input", action="store_true",
                         help="입력 프레임을 좌우반전(처리와 표시 모두 반전된 영상 기준)")
-    parser.add_argument("--hflip_view", action="store_true",
-                        help="시각화만 좌우반전(내부 처리는 원본 기준)")
+
+    # 회전 OCR 토글
+    parser.add_argument("--rot_disable", action="store_true",
+                        help="회전 견고 OCR 비활성화(기존 segmented/fallback만 사용)")
 
     args = parser.parse_args()
-    VOTE_MIN = DEFAULT_VOTE_MIN # VOTE_MIN 초기화 추가
-
-    # 구역 매핑 로드
-    RIGHT, LEFT = load_zone_map(args.zone_map)
-    print(f"[MAP] RIGHT={RIGHT}  LEFT={LEFT}")
+    VOTE_MIN = DEFAULT_VOTE_MIN
 
     # NanoDet
-    load_config(cfg, args.config)
+    load_config(cfg, DEFAULT_CONFIG_PATH)
     logger = Logger(-1, use_tensorboard=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    predictor = Predictor(cfg, args.model, logger, device=device)
+    predictor = Predictor(cfg, DEFAULT_MODEL_PATH, logger, device=device)
 
     # Camera
     cap = cv2.VideoCapture(args.camid, cv2.CAP_DSHOW)
@@ -537,11 +606,8 @@ def main():
 
     frame_idx = 0
     best_box = None
-    save_dir = os.path.join(script_dir, "roi_debug")
-    if args.save_rois and not os.path.exists(save_dir):
-        os.makedirs(save_dir, exist_ok=True)
 
-    sender = SerialSender(args.serial_port, args.baud, dup_policy=args.dup_policy, disable_serial=args.disable_serial)
+    sender = SerialSender(args.serial_port, BAUD_RATE, dup_policy=args.dup_policy, disable_serial=args.disable_serial)
 
     print("[INFO] Press 'q' or close window to quit.")
     try:
@@ -550,7 +616,6 @@ def main():
             if not ok:
                 print("[WARN] camera read failed."); break
 
-            # === 입력 단계 좌우반전(처리/표시 모두 뒤집힌 영상 기준) ===
             if args.hflip_input:
                 frame = cv2.flip(frame, 1)
 
@@ -563,7 +628,7 @@ def main():
                 boxes = extract_boxes(res[0])
                 chosen = None
                 for score, x1, y1, x2, y2 in boxes:
-                    if score < args.conf: continue
+                    if score < CONF_THRESH: continue
                     x1, y1, x2, y2 = int(x1/scale), int(y1/scale), int(x2/scale), int(y2/scale)
                     area = max(0,(x2-x1))*max(0,(y2-y1))
                     key = (score, area)
@@ -583,8 +648,6 @@ def main():
                     cv2.rectangle(vis, (x1,y1),(x2,y2),(0,255,0),2)
                     cv2.putText(vis, f"waybill {score:.2f}", (x1, max(0,y1-6)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2, cv2.LINE_AA)
-                if args.save_rois and roi.size>0 and frame_idx%10==0:
-                    cv2.imwrite(os.path.join(save_dir, f"roi_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"), roi)
 
             # 3) OCR 제출(ROI 변동 없어도 표결 미완이면 계속)
             now = time.time()
@@ -592,20 +655,19 @@ def main():
             if roi is not None and (now - last_ocr_t) >= OCR_MIN_INTERVAL:
                 if roi_changed(prev_roi, roi) or need_more_votes:
                     if pending is None or pending.done():
-                        def worker(img, dbg):
-                            return ocr_code_segmented(img, dbg)
-                        pending = executor.submit(worker, roi.copy(), args.debug_ocr)
+                        def worker(img, dbg, rot_off):
+                            return ocr_with_rotation(img, dbg, rot_off)
+                        pending = executor.submit(worker, roi.copy(), args.debug_ocr, args.rot_disable)
                         last_ocr_t = now
                         prev_roi = roi.copy()
 
-            # 4) 결과 수거 + 즉시/연속/다수결 +  시리얼 전송
+            # 4) 결과 수거 + 즉시/연속/다수결 + 시리얼 전송
             if pending is not None and pending.done():
                 (code, immediate) = pending.result()
                 pending = None
                 if code:
                     code = canon(code)
 
-                    # === 콘솔 출력(기존 로직 유지) ===
                     if immediate:
                         print(code)
                         last_emitted = code
@@ -633,26 +695,16 @@ def main():
                                 last_emitted = common
                                 streak_code, streak_cnt = "", 0
 
-                    # === 전송: last_emitted 기준으로만 보냄 ===
                     if last_emitted:
-                        zone = code_to_zone(last_emitted)
+                        zone = code_to_zone(last_emitted)  # 619A02 -> 600
                         if zone is not None:
-                            side, idx = zone_to_side_idx(zone, RIGHT, LEFT)
-                            if side is not None and idx is not None:
-                                # Arduino로 "R3\n" 또는 "L2\n" 전송
-                                sender.send(side, idx)
-                            else:
-                                print(f"[WARN] zone {zone} not in mapping (RIGHT/LEFT)")
+                            sender.send_code(zone)
                         else:
                             print("[WARN] code->zone failed:", last_emitted)
 
             # 5) 뷰
             if viewer is not None:
-                # 시각화만 좌우반전: 입력 반전이 이미 적용되어 있으면 이중 반전 방지
-                vis_to_show = vis
-                if args.hflip_view and not args.hflip_input:
-                    vis_to_show = cv2.flip(vis, 1)
-                viewer.update(vis_to_show)
+                viewer.update(vis)
                 if viewer.stop: break
 
             frame_idx += 1
