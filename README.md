@@ -19,8 +19,8 @@
 
 | 분야 | 사용 기술 |
 |------|------------|
-| 하드웨어 | Arduino Uno, Servo Motor, 초음파 센서, 웹캠 |
-| 소프트웨어 | Python 3.13, OpenCV, RapidOCR, PySerial |
+| 하드웨어 | Arduino Uno, Raspberry pi, Servo Motor, 초음파 센서, 웹캠 |
+| 소프트웨어 | Python 3.10, OpenCV, Nanodet, RapidOCR, PySerial |
 | 모델 | RapidOCR (ONNX 기반 문자 인식 모델) |
 | 통신 방식 | Serial (USB 기반 데이터 송수신) |
 
