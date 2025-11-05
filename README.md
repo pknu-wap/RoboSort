@@ -33,4 +33,4 @@
 | <img src="https://github.com/hheyyeon21.png" width="100" height="100" /> | **이름:** 문희연<br>**역할:** 팀장<br>**담당 내용:** 프로젝트 총괄<br>
 | <img src="https://github.com/wave1009.png" width="100" height="100" /> | **이름:** 김물결<br>**역할:** 소프트웨어<br>**담당 내용:** Python OCR 로직 및 RapidOCR 적용<br>
 | <img src="https://github.com/leeseungmin313.png" width="100" height="100" /> | **이름:** 이승민<br>**역할:** 하드웨어<br>**담당 내용:** 아두이노 서보모터 및 센서 제어<br>
-| <img src="https://github.com/jisuuuu21.png" width="100" height="100" /> | **이름:** 김지수<br>**역할:** <br>**담당 내용:** 전체 설계 및 회로 다이어그램 디자인<br>
+| <img src="https://github.com/jisuuuu21.png" width="100" height="100" /> | **이름:** 김지수<br>**역할:** 설계<br>**담당 내용:** 전체 설계 및 회로 다이어그램 디자인<br>
