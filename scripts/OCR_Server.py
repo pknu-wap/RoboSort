@@ -44,17 +44,13 @@ from nanodet.util import cfg, load_config, Logger
 from demo.demo import Predictor
 import rapidocr_onnxruntime
 
+
 # ===================== PiSender =====================
 class PiSender:
     def __init__(self, pi_ip: str):
         self.base = f"http://{pi_ip}:5000"
 
     def send_code(self, code: int) -> bool:
-        """
-        운송장 존 코드 전송.
-        - Pi에서 status=ok 이면 True
-        - busy / error / 통신 실패면 False
-        """
         url = f"{self.base}/send_code"
         try:
             r = requests.post(url, json={"code": code}, timeout=1.0)
@@ -65,30 +61,23 @@ class PiSender:
             print("[SEND TO PI /send_code]", code, data)
 
             status = data.get("status", "")
-            if status == "ok":
-                return True
-            elif status == "busy":
-                return False
-            else:
-                return False
+            return status == "ok"
         except Exception as e:
             print("[WARN] Failed to send code to Pi:", e)
             return False
 
     def send_unload_num(self, num: int):
-        """
-        하역 마커(ArUco) 번호 전송.
-        """
-        url = f"{self.base}/unload_number"
+        url = f"{self.base}/marker"
         try:
             r = requests.post(url, json={"num": num}, timeout=0.5)
             try:
                 data = r.json()
             except Exception:
                 data = {}
-            print("[SEND TO PI /unload_number]", num, data)
+            print("[SEND TO PI /marker]", num, data)
         except Exception as e:
             print("[WARN] Failed to send unload num to Pi:", e)
+
 
 # ===================== Matplotlib 뷰어 =====================
 class MatplotlibViewer:
@@ -134,6 +123,7 @@ class MatplotlibViewer:
         self.plt.ioff()
         self.plt.close(self.fig)
 
+
 # ===================== 전처리 / 유틸 =====================
 def preprocess_otsu(bgr: np.ndarray) -> np.ndarray:
     h, w = bgr.shape[:2]
@@ -144,6 +134,7 @@ def preprocess_otsu(bgr: np.ndarray) -> np.ndarray:
     _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     return cv2.morphologyEx(th, cv2.MORPH_OPEN, k, iterations=1)
+
 
 def preprocess_adaptive(bgr: np.ndarray) -> np.ndarray:
     h, w = bgr.shape[:2]
@@ -159,8 +150,10 @@ def preprocess_adaptive(bgr: np.ndarray) -> np.ndarray:
         10,
     )
 
+
 def maybe_invert(bin_img: np.ndarray) -> np.ndarray:
     return cv2.bitwise_not(bin_img) if (bin_img > 127).mean() < 0.45 else bin_img
+
 
 def clamp_box(x1, y1, x2, y2, w, h, margin_ratio=0.05):
     bw, bh = x2 - x1, y2 - y1
@@ -171,6 +164,7 @@ def clamp_box(x1, y1, x2, y2, w, h, margin_ratio=0.05):
     x2 = min(w - 1, x2 + mx)
     y2 = min(h - 1, y2 + my)
     return x1, y1, x2, y2
+
 
 def roi_changed(prev: Optional[np.ndarray], cur: np.ndarray, thresh: float = ROI_DIFF_THRESH) -> bool:
     if prev is None or prev.size == 0:
@@ -183,13 +177,16 @@ def roi_changed(prev: Optional[np.ndarray], cur: np.ndarray, thresh: float = ROI
         b = cv2.cvtColor(b, cv2.COLOR_BGR2GRAY)
     return float(cv2.absdiff(a, b).mean()) > thresh
 
+
 def crop_top_band(roi_bgr: np.ndarray, ratio: float = TOP_BAND_RATIO) -> np.ndarray:
     h = roi_bgr.shape[0]
     hh = max(10, int(h * ratio))
     return roi_bgr[:hh, :]
 
+
 def canon(code: str) -> str:
     return re.sub(r"\s+", " ", code.strip().upper())
+
 
 # ===================== NanoDet 결과 파싱 =====================
 def extract_boxes(nanodet_result) -> List[tuple]:
@@ -219,6 +216,7 @@ def extract_boxes(nanodet_result) -> List[tuple]:
         pass
     return boxes
 
+
 # ===================== 밴드/토큰 분리 (운송장용) =====================
 def pick_text_band(bin_img: np.ndarray) -> np.ndarray:
     black = (bin_img < 128).astype(np.uint8)
@@ -238,12 +236,14 @@ def pick_text_band(bin_img: np.ndarray) -> np.ndarray:
     y2 = min(bin_img.shape[0] - 1, y2 + pad)
     return bin_img[y1 : y2 + 1, :]
 
+
 def trim_lr(img: np.ndarray) -> np.ndarray:
     col = (img < 128).mean(axis=0)
     nz = np.where(col > 0.02)[0]
     if nz.size == 0:
         return img
     return img[:, nz[0] : nz[-1] + 1]
+
 
 def split_letter_digits_cut(token: np.ndarray) -> Optional[int]:
     black = (token < 128).astype(np.uint8)
@@ -259,6 +259,7 @@ def split_letter_digits_cut(token: np.ndarray) -> Optional[int]:
     if cut <= 1 or cut >= W - 2:
         return None
     return cut
+
 
 def split_by_spaces(bin_band: np.ndarray) -> Optional[List[np.ndarray]]:
     black = (bin_band < 128).astype(np.uint8)
@@ -287,6 +288,7 @@ def split_by_spaces(bin_band: np.ndarray) -> Optional[List[np.ndarray]]:
         return None
     return [left, trim_lr(right[:, :cut]), trim_lr(right[:, cut:])]
 
+
 # ===================== RapidOCR 래퍼 (운송장) =====================
 try:
     rapidocr_dir = os.path.dirname(rapidocr_onnxruntime.__file__)
@@ -301,6 +303,7 @@ try:
 except (ImportError, AttributeError):
     print("[WARN] rapidocr_onnxruntime not found or `__file__` not available.")
     det_model_path, rec_model_path, cls_model_path = None, None, None
+
 
 class RapidRec:
     def __init__(self):
@@ -355,7 +358,9 @@ class RapidRec:
             pass
         return out
 
+
 rapid = RapidRec()
+
 
 # ===================== 숫자 3글자 분할 (운송장 왼쪽) =====================
 def split_three_chars(bin_img: np.ndarray) -> Optional[List[np.ndarray]]:
@@ -377,6 +382,7 @@ def split_three_chars(bin_img: np.ndarray) -> Optional[List[np.ndarray]]:
     c = trim_lr(bin_img[:, cuts[1] :])
     return [a, b, c]
 
+
 def read_left_digits_strict(left_bin: np.ndarray) -> Optional[str]:
     if left_bin is None or left_bin.size == 0:
         return None
@@ -392,6 +398,7 @@ def read_left_digits_strict(left_bin: np.ndarray) -> Optional[str]:
             return None
         out.append(d[0])
     return "".join(out)
+
 
 # ===================== OCR (운송장) =====================
 def ocr_code_segmented(roi_bgr: np.ndarray, debug=False) -> Tuple[Optional[str], bool]:
@@ -446,6 +453,7 @@ def ocr_code_segmented(roi_bgr: np.ndarray, debug=False) -> Tuple[Optional[str],
             return cand, False
     return None, False
 
+
 # ===================== 회전 유틸/로직 (운송장) =====================
 def rotate_bound(img: np.ndarray, angle_deg: float) -> np.ndarray:
     if angle_deg % 360 == 0:
@@ -462,6 +470,7 @@ def rotate_bound(img: np.ndarray, angle_deg: float) -> np.ndarray:
     return cv2.warpAffine(
         img, M, (nW, nH), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
     )
+
 
 def ocr_code_rotation_adaptive(
     roi_bgr: np.ndarray,
@@ -528,6 +537,7 @@ def ocr_code_rotation_adaptive(
         return best_cand2, False
     return None, False
 
+
 def resize_for_detect(frame: np.ndarray, det_w: int):
     h, w = frame.shape[:2]
     if w <= det_w:
@@ -536,6 +546,7 @@ def resize_for_detect(frame: np.ndarray, det_w: int):
     small = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
     return small, scale
 
+
 # ===================== 구역 / zone 유틸 =====================
 def code_to_zone(code: str) -> Optional[int]:
     m = re.search(r"(\d{3})\s?[A-Z]\d{2}", code.upper())
@@ -543,6 +554,7 @@ def code_to_zone(code: str) -> Optional[int]:
         return None
     abc = int(m.group(1))
     return (abc // 100) * 100
+
 
 # ===================== ArUco 기반 하역 번호 인식 =====================
 try:
@@ -562,6 +574,7 @@ ARUCO_ID_TO_UNLOAD = {
 }
 
 ARUCO_DETECTOR = aruco.ArucoDetector(ARUCO_DICT, aruco.DetectorParameters())
+
 
 def detect_unload_number(frame: np.ndarray, debug=False) -> Optional[int]:
     if frame is None or frame.size == 0:
@@ -583,38 +596,23 @@ def detect_unload_number(frame: np.ndarray, debug=False) -> Optional[int]:
 
     return None
 
+
 # ===================== 메인 =====================
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument(
-        "--url",
-        type=str,
-        default=None,
-        help="라즈베리파이 메인카메라 MJPEG 주소 (/cam)",
-    )
-    parser.add_argument(
-        "--unload_url",
-        type=str,
-        default=None,
-        help="하역용 USB카메라 MJPEG 주소 (없으면 pi_ip 기준 /unload_cam)",
-    )
+    parser.add_argument("--url", type=str,default=None)
+    parser.add_argument("--unload_url", type=str, default=None)
     parser.add_argument("--camid", type=int, default=0)
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--debug_ocr", action="store_true")
-    parser.add_argument(
-        "--pi_ip",
-        type=str,
-        required=True,
-        help="라즈베리파이 IP 주소 (예: 192.168.137.100)",
-    )
+    parser.add_argument("--pi_ip", type=str, required=True)
     parser.add_argument("--hflip_input", action="store_true")
     parser.add_argument("--rot_disable", action="store_true")
+    parser.add_argument("--no_marker", action="store_true")
 
     args = parser.parse_args()
-    VOTE_MIN = DEFAULT_VOTE_MIN  # (현재는 streak 로직에 VOTE_LEN 사용)
 
-    # NanoDet 불러오기
     load_config(cfg, os.path.join(project_root, "nanodet_waybill.yml"))
     logger = Logger(-1, use_tensorboard=False)
 
@@ -626,7 +624,6 @@ def main():
         device=device,
     )
 
-    # 메인 카메라 오픈
     if args.url:
         print(f"[INFO] Opening main stream from URL: {args.url}")
         cap = cv2.VideoCapture(args.url, cv2.CAP_FFMPEG)
@@ -642,7 +639,6 @@ def main():
         print("[ERROR] Failed to open main video source (isOpened() == False)")
         return 1
 
-    # 하역 카메라 URL 결정
     if args.unload_url:
         unload_url = args.unload_url
     else:
@@ -696,9 +692,6 @@ def main():
             num = detect_unload_number(frame2, debug=args.debug_ocr)
             if num is not None:
                 now = time.time()
-                # 메시지 폭탄 방지:
-                #   - 같은 번호는 최소 0.2초 간격
-                #   - 1초 이상 지나면 한 번 더 보내서 보정
                 if (num != last_sent and (now - last_sent_t) >= 0.2) or (
                     now - last_sent_t
                 ) >= 1.0:
@@ -709,8 +702,13 @@ def main():
         cap2.release()
         print("[INFO] Unload worker stopped.")
 
-    th_unload = threading.Thread(target=unload_worker, daemon=True)
-    th_unload.start()
+    th_unload = None
+    if not args.no_marker:
+        th_unload = threading.Thread(target=unload_worker, daemon=True)
+        th_unload.start()
+        print("[INFO] Marker worker ENABLED")
+    else:
+        print("[INFO] Marker worker DISABLED (--no_marker)")
 
     print("[INFO] Press 'q' (Matplotlib 창) or Ctrl+C to quit.")
 
@@ -724,7 +722,7 @@ def main():
             if args.hflip_input:
                 frame = cv2.flip(frame, 1)
 
-            # ================= 여기부터 WAYBILL OCR 항상 실행 =================
+            # ================= 운송장 OCR 항상 실행 =================
             need_detect = (frame_idx % max(1, DETECT_EVERY) == 0) or (best_box is None)
             vis = frame
             if need_detect:
@@ -809,10 +807,7 @@ def main():
                             print("[WAYBILL]", emit_code, "=> zone", zone)
                             last_emitted = emit_code
                         else:
-                            print(
-                                "[WAYBILL] Pi busy or send failed, will retry later:",
-                                emit_code,
-                            )
+                            print("[WAYBILL] Failed to send zone to Pi:", emit_code)
 
             if viewer is not None:
                 viewer.update(vis)
@@ -832,6 +827,7 @@ def main():
             pass
 
     return 0
+
 
 if __name__ == "__main__":
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"

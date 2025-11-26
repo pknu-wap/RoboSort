@@ -48,7 +48,6 @@ data:
     input_size: [640,640]
     keep_ratio: True
     pipeline:
-      # 파인튜닝용 “안정형” augmentation
       scale: [0.9, 1.1]
       rotation: 10
       translate: 0.08
@@ -61,7 +60,7 @@ data:
   val:
     name: YoloDataset
     class_names: ['waybill']
-    img_path: dataset/images/val      # 원본 검증 이미지는 유지
+    img_path: dataset/images/val
     ann_path: dataset/labels/val
     input_size: [640,640]
     keep_ratio: True
@@ -69,17 +68,21 @@ data:
       normalize: [[103.53, 116.28, 123.675], [57.375, 57.12, 58.395]]
 
 device:
-  gpu_ids: -1     # CPU 학습
+  gpu_ids: -1
   workers_per_gpu: 2
   batchsize_per_gpu: 12
 
 schedule:
-  # === 기존 모델에서 파인튜닝 ===
+  # 이어 학습을 위한 설정
+  resume: True
+  resume_path: workspace/waybill_finetune/model_last.ckpt
+
+  # 처음 파인튜닝 시 불러오는 모델 (resume=True이면 무시됨)
   load_model: workspace/waybill_new2/model_last.ckpt
 
   optimizer:
     name: AdamW
-    lr: 0.00025       # 최적 파인튜닝 학습률
+    lr: 0.00025
     weight_decay: 0.05
 
   warmup:
@@ -87,8 +90,7 @@ schedule:
     steps: 300
     ratio: 0.0001
 
-  # === 데이터 1500장 기준 최적 epoch ===
-  total_epochs: 140     # 120~180 중 최적대역
+  total_epochs: 140
   lr_schedule:
     name: CosineAnnealingLR
     T_max: 140
