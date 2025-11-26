@@ -613,13 +613,13 @@ def main():
 
     args = parser.parse_args()
 
-    load_config(cfg, os.path.join(project_root, "nanodet_waybill.yml"))
+    load_config(cfg, os.path.join(project_root, "nanodet_waybill_finetune.yml"))
     logger = Logger(-1, use_tensorboard=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     predictor = Predictor(
         cfg,
-        os.path.join(project_root, "nanodet", "workspace", "waybill", "model_last.ckpt"),
+        os.path.join(project_root, "nanodet", "workspace", "waybill_finetune", "model_last.ckpt"),
         logger,
         device=device,
     )
