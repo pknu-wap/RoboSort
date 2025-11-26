@@ -10,6 +10,7 @@
 /dataset/
 /images/
 /dataset_raw/
+/dataset_augmented/
 
 # IDE and editor files
 .idea/

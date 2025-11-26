@@ -1,19 +1,16 @@
 import cv2
-import numpy as np
+import cv2.aruco as aruco
 
-dict_name = cv2.aruco.DICT_4X4_50
-aruco_dict = cv2.aruco.getPredefinedDictionary(dict_name)
+# 저장될 경로
+SAVE_DIR = "./markers"
 
-def save_marker(marker_id, side_px=800, pad_ratio=0.20, path=None, border_bits=1):
-    marker = np.full((side_px, side_px), 255, dtype=np.uint8)
-    cv2.aruco.generateImageMarker(aruco_dict, marker_id, side_px, marker, border_bits)
-    pad = int(side_px * pad_ratio)
-    marker = cv2.copyMakeBorder(marker, pad, pad, pad, pad,
-                                cv2.BORDER_CONSTANT, value=255)
-    path = path or f"aruco_{marker_id}.png"
-    cv2.imwrite(path, marker)
-    print("saved:", path)
+# 사용할 딕셔너리 (4x4_1000 → ID 0~999 사용 가능)
+aruco_dict = aruco.Dictionary_get(aruco.DICT_4X4_1000)
 
-for zid, mid in {0:10,100:11,200:12,300:13,400:14,500:15,600:16,700:17,800:18,900:19}.items():
-    save_marker(mid, side_px=800, pad_ratio=0.20, path=f"zone{zid}_id{mid}.png")
+nums = [100, 200, 300, 400, 500, 600]
 
+for n in nums:
+    marker = aruco.drawMarker(aruco_dict, n, 400)  # 400px 정사각형
+    cv2.imwrite(f"{SAVE_DIR}/{n}.png", marker)
+
+print("완료: markers/*.png 생성됨")

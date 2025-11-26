@@ -1,0 +1,104 @@
+save_dir: workspace/waybill_finetune
+class_names: ['waybill']
+
+model:
+  arch:
+    name: OneStageDetector
+    backbone:
+      name: ShuffleNetV2
+      model_size: 1.5x
+      out_stages: [3,4]
+      activation: LeakyReLU
+
+    fpn:
+      name: PAN
+      in_channels: [352, 704]
+      out_channels: 96
+      num_outs: 2
+
+    head:
+      name: NanoDetHead
+      num_classes: 1
+      input_channel: 96
+      feat_channels: 96
+      stacked_convs: 2
+      strides: [16, 32]
+      reg_max: 7
+      norm_cfg:
+        type: BN
+      loss:
+        loss_qfl:
+          name: QualityFocalLoss
+          use_sigmoid: True
+          beta: 2.0
+          loss_weight: 1.0
+        loss_dfl:
+          name: DistributionFocalLoss
+          loss_weight: 0.25
+        loss_bbox:
+          name: GIoULoss
+          loss_weight: 2.0
+
+data:
+  train:
+    name: YoloDataset
+    class_names: ['waybill']
+    img_path: ../dataset_augmented/images/train
+    ann_path: ../dataset_augmented/labels/train
+    input_size: [640,640]
+    keep_ratio: True
+    pipeline:
+      # 파인튜닝용 “안정형” augmentation
+      scale: [0.9, 1.1]
+      rotation: 10
+      translate: 0.08
+      flip: 0.4
+      brightness: 0.15
+      contrast: [0.85, 1.2]
+      saturation: [0.85, 1.2]
+      normalize: [[103.53, 116.28, 123.675], [57.375, 57.12, 58.395]]
+
+  val:
+    name: YoloDataset
+    class_names: ['waybill']
+    img_path: dataset/images/val      # 원본 검증 이미지는 유지
+    ann_path: dataset/labels/val
+    input_size: [640,640]
+    keep_ratio: True
+    pipeline:
+      normalize: [[103.53, 116.28, 123.675], [57.375, 57.12, 58.395]]
+
+device:
+  gpu_ids: -1     # CPU 학습
+  workers_per_gpu: 2
+  batchsize_per_gpu: 12
+
+schedule:
+  # === 기존 모델에서 파인튜닝 ===
+  load_model: workspace/waybill_new2/model_last.ckpt
+
+  optimizer:
+    name: AdamW
+    lr: 0.00025       # 최적 파인튜닝 학습률
+    weight_decay: 0.05
+
+  warmup:
+    name: linear
+    steps: 300
+    ratio: 0.0001
+
+  # === 데이터 1500장 기준 최적 epoch ===
+  total_epochs: 140     # 120~180 중 최적대역
+  lr_schedule:
+    name: CosineAnnealingLR
+    T_max: 140
+    eta_min: 0.00005
+
+  val_intervals: 10
+
+evaluator:
+  name: CocoDetectionEvaluator
+  save_key: mAP
+
+log:
+  interval: 20
