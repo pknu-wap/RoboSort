@@ -28,8 +28,8 @@ BAUD_RATE = 9600        # 시리얼 보드레이트 (아두이노 스케치와 �
 # NanoDet 경로
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
-DEFAULT_CONFIG_PATH = os.path.join(project_root, "nanodet_waybill.yml")
-DEFAULT_MODEL_PATH  = os.path.join(project_root, "nanodet", "workspace", "waybill_new", "model_last.ckpt")
+DEFAULT_CONFIG_PATH = os.path.join(project_root, "nanodet_waybill_finetune.yml")
+DEFAULT_MODEL_PATH  = os.path.join(project_root, "nanodet", "workspace", "waybill_finetune", "model_last.ckpt")
 
 CODE_REGEX = re.compile(r"\b\d{3}\s?[A-Z]\d{2}\b")  # 운송장 번호 정규식
 ALLOWLIST = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ " # OCR 허용 문자
