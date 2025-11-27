@@ -10,7 +10,23 @@ import concurrent.futures as futures
 from typing import Tuple, Optional, List
 import threading
 import requests
+from flask import Flask, request, jsonify
 
+pc_app = Flask(__name__)
+
+@pc_app.route("/complete", methods=["POST"])
+def pc_complete():
+    global is_busy, busy_zone
+    print("[PC EVENT] Received COMPLETE from Pi")
+    is_busy = False
+    busy_zone = None
+    return jsonify({"status": "ok"})
+
+def run_pc_server():
+    pc_app.run(host="0.0.0.0", port=6000, threaded=True)
+
+# 스레드로 실행
+threading.Thread(target=run_pc_server, daemon=True).start()
 # ===================== 하이퍼 파라미터 =====================
 DETECT_EVERY = 3
 DETECT_WIDTH = 640
@@ -28,7 +44,9 @@ ROT_BASE_ANGLES = [0.0, 180.0]
 ROT_EXTRA_ANGLES = [90.0, -90.0, 45.0, -45.0]
 ROT_SCORE_THR = 0.65
 IMMEDIATE_SCORE_THR = 0.90
-
+last_sent_zone = None
+is_busy = False
+busy_zone = None
 # ===================== 경로 설정 =====================
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
@@ -599,6 +617,9 @@ def detect_unload_number(frame: np.ndarray, debug=False) -> Optional[int]:
 
 # ===================== 메인 =====================
 def main():
+    global last_sent_zone
+    global is_busy, busy_zone
+
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--url", type=str,default=None)
@@ -800,15 +821,27 @@ def main():
                             streak_cnt = 0
 
                 if emit_code and emit_code != last_emitted:
+                    if is_busy:
+                        if busy_zone is None:
+                            print("[BUSY] busy but zone unknown → ignoring")
+                            continue
+                        if code_to_zone(emit_code) != busy_zone:
+                            print(f"[BUSY] ignoring OCR {emit_code} (busy with zone {busy_zone})")
+                            continue
                     zone = code_to_zone(emit_code)
                     if zone is not None:
-                        ok_send = sender.send_code(zone)
-                        if ok_send:
-                            print("[WAYBILL]", emit_code, "=> zone", zone)
-                            last_emitted = emit_code
+                        if zone == last_sent_zone:
+                            print("[WAYBILL] same zone detected → skip:", zone)
                         else:
-                            print("[WAYBILL] Failed to send zone to Pi:", emit_code)
-
+                            ok_send = sender.send_code(zone)
+                            if ok_send:
+                                print("[WAYBILL]", emit_code, "=> zone", zone)
+                                last_sent_zone = zone
+                                is_busy = True
+                                busy_zone = zone
+                            else:
+                                print("[WAYBILL] Failed to send zone to Pi:", emit_code)
+                        last_emitted = emit_code
             if viewer is not None:
                 viewer.update(vis)
                 if viewer.stop:
