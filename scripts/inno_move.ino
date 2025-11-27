@@ -56,34 +56,40 @@ void loop()
     if (boxNumStr.startsWith("100"))
     {
       tiltLeft();
+      Serial.println("Done");
     }
     else if (boxNumStr.startsWith("200"))
     {
       moveForward(m);
       tiltLeft();
       moveBackward(m);
+      Serial.println("Done");
     }
     else if (boxNumStr.startsWith("300"))
     {
       moveForward(2*m);
       tiltLeft();
       moveBackward(2*m);
+      Serial.println("Done");
     }
     else if (boxNumStr.startsWith("400"))
     {
       tiltRight();
+      Serial.println("Done");
     }
     else if (boxNumStr.startsWith("500"))
     {
       moveForward(m);
       tiltRight();
       moveBackward(m);
+      Serial.println("Done");
     }
     else if (boxNumStr.startsWith("600"))
     {
       moveForward(2*m);
       tiltRight();
       moveBackward(2*m);
+      Serial.println("Done");
     }
     else
     {
@@ -161,17 +167,19 @@ void moveBackward(int duration)
   stopAll();
 }
 
+
 void tiltRight()
 {
-  servo1.write(s+30);
-  servo2.write(s-30);
+  servo1.write(s + 30);
+  servo2.write(s - 30);
   delay(2000);
 
-  servo1.write(s);               
+  servo1.write(s);
   servo2.write(s);
-
   delay(1000);
+
 }
+
 
 void tiltLeft()
 {
@@ -181,6 +189,6 @@ void tiltLeft()
 
   servo1.write(s);
   servo2.write(s);
-
   delay(1000);
+
 }

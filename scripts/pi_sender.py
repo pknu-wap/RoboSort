@@ -7,9 +7,12 @@ from flask import Flask, Response, request, jsonify
 from threading import Thread, Lock
 from picamera2 import Picamera2
 from libcamera import controls
+import requests
+
+app = Flask(__name__)
 
 # ===========================================================
-#                Arduino Serial
+# Arduino Serial
 # ===========================================================
 try:
     ser = serial.Serial("/dev/ttyACM0", 9600, timeout=1)
@@ -21,7 +24,13 @@ except Exception as e:
 
 serial_lock = Lock()
 
-def send_to_arduino(line: bytes) -> bool:
+# -----------------------------------------
+# -----------------------------------------
+PC_IP = "10.112.249.124"
+PC_COMPLETE_URL = f"http://{PC_IP}:6000/complete"
+
+
+def send_to_arduino(line: bytes):
     global ser
     if ser is None:
         print("[ARDUINO-DRY]", line)
@@ -32,66 +41,46 @@ def send_to_arduino(line: bytes) -> bool:
             ser.flush()
         print("[ARDUINO-TX]", line)
         return True
-    except Exception as e:
-        print("[WARN] Arduino write failed:", e)
+    except Exception:
+        print("[WARN] Arduino write failed")
         ser = None
         return False
 
-# ===========================================================
-#                   FSM States
-# ===========================================================
-FSM_IDLE = "IDLE"
-FSM_MOVING = "MOVING_TO_TARGET"
-FSM_UNLOADING = "UNLOADING"
-FSM_RETURNING = "RETURNING_HOME"
-
-fsm_state = FSM_IDLE
-is_busy = False
-current_target_zone = None
-arduino_reader_running = True
 
 # ===========================================================
-#                Arduino Reader Thread
 # ===========================================================
-def arduino_reader_loop():
-    global ser, fsm_state, is_busy, current_target_zone
+def arduino_listener():
+    global ser
+    if ser is None:
+        print("[WARN] Arduino not connected -> listener disabled")
+        return
 
-    print("[INFO] Arduino reader started")
+    print("[ARDUINO] Listener started")
 
-    while arduino_reader_running:
-        if ser is None:
-            time.sleep(0.2)
-            continue
-
+    while True:
         try:
-            line = ser.readline()
-            if not line:
+            raw = ser.readline().decode(errors="ignore").strip()
+            if not raw:
                 continue
 
-            s = line.decode(errors="ignore").strip()
-            if not s:
-                continue
+            print("[ARDUINO-RX]", raw)
 
-            print("[ARDUINO-RX]", s)
-
-            if s == "UNLOAD_DONE":
-                fsm_state = FSM_RETURNING
-                send_to_arduino(b"BACK\n")
-
-            elif s == "DONE":
-                is_busy = False
-                fsm_state = FSM_IDLE
-                current_target_zone = None
+            if raw == "DONE":
+                print("[EVENT] DONE received -> notifying PC")
+                try:
+                    requests.post(PC_COMPLETE_URL, timeout=0.5)
+                except Exception as e:
+                    print("[WARN] Failed to notify PC:", e)
 
         except Exception as e:
-            print("[WARN] Arduino read failed:", e)
-            ser = None
+            print("[ARDUINO] Listener exception:", e)
             time.sleep(0.5)
 
-Thread(target=arduino_reader_loop, daemon=True).start()
+
+Thread(target=arduino_listener, daemon=True).start()
 
 # ===========================================================
-#               Picamera2 Main Camera
+# Picamera2 (Main Cam)
 # ===========================================================
 picam2 = Picamera2()
 cfg = picam2.create_video_configuration(
@@ -100,25 +89,34 @@ cfg = picam2.create_video_configuration(
 picam2.configure(cfg)
 picam2.start()
 
-picam2.set_controls({
-    "AfMode": controls.AfModeEnum.Continuous,
-    "AfTrigger": controls.AfTriggerEnum.Start,
-})
+try:
+    picam2.set_controls({
+        "AfMode": controls.AfModeEnum.Continuous,
+        "AfTrigger": controls.AfTriggerEnum.Start,
+    })
+except Exception:
+    print("[WARN] Autofocus not supported")
+
 
 def gen_main_cam():
     while True:
         frame = picam2.capture_array()
         ok, jpeg = cv2.imencode(".jpg", frame)
-        if not ok:
-            continue
-        yield (
-            b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
-            + jpeg.tobytes()
-            + b"\r\n"
-        )
+        if ok:
+            yield (
+                b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                + jpeg.tobytes()
+                + b"\r\n"
+            )
+
+
+@app.route("/cam")
+def cam():
+    return Response(gen_main_cam(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
 
 # ===========================================================
-#            USB Webcam (Unload Camera) Auto Detect
+# USB Webcam (Unload Cam)
 # ===========================================================
 def find_usb_device():
     for dev in ["/dev/video0", "/dev/video1", "/dev/video2", "/dev/video4"]:
@@ -130,18 +128,20 @@ def find_usb_device():
     print("[USB] No USB camera found")
     return None
 
+
 USB_DEVICE = find_usb_device()
 
 usb_cap = None
 usb_frame = None
 usb_lock = Lock()
-usb_thread_running = False
+usb_thread_running = True
+
 
 def usb_loop():
-    global usb_cap, usb_frame, usb_thread_running
+    global usb_cap, usb_frame
 
     if USB_DEVICE is None:
-        print("[USB] No USB device detected -> cannot start loop")
+        print("[USB] No USB device")
         return
 
     print("[USB] usb_loop started")
@@ -155,7 +155,7 @@ def usb_loop():
                 usb_cap = cap
                 print("[USB] Webcam opened:", USB_DEVICE)
             else:
-                print("[USB] open failed, retry")
+                print("[USB] Open failed, retry")
                 time.sleep(1)
                 continue
 
@@ -167,35 +167,10 @@ def usb_loop():
         with usb_lock:
             usb_frame = cv2.flip(frame, 1)
 
-        time.sleep(1.0 / 30.0)
+        time.sleep(1 / 30.0)
 
-def start_usb_thread():
-    global usb_thread_running
-    if usb_thread_running:
-        return
-    usb_thread_running = True
-    Thread(target=usb_loop, daemon=True).start()
-    print("[USB] Started USB capture thread")
+Thread(target=usb_loop, daemon=True).start()
 
-def stop_usb_thread():
-    global usb_thread_running, usb_cap
-    usb_thread_running = False
-    if usb_cap:
-        try:
-            usb_cap.release()
-        except:
-            pass
-        usb_cap = None
-    print("[USB] Stopped USB capture thread")
-
-# ===========================================================
-#                Flask Web Server
-# ===========================================================
-app = Flask(__name__)
-
-@app.route("/cam")
-def cam():
-    return Response(gen_main_cam(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 @app.route("/unload_cam")
 def unload_cam():
@@ -217,90 +192,67 @@ def unload_cam():
                     + b"\r\n"
                 )
 
-            time.sleep(1.0 / 20.0)
+            time.sleep(1 / 20.0)
 
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
+
 # ===========================================================
-#                    API: PC -> Pi
+# API
 # ===========================================================
 @app.route("/send_code", methods=["POST"])
 def send_code():
-    global fsm_state, is_busy, current_target_zone
-
     data = request.json if request.is_json else {}
     code = data.get("code")
 
-    if is_busy:
-        return jsonify({"status": "busy"})
-
     try:
         zone = int(code)
-    except:
+    except Exception:
         return jsonify({"status": "error"}), 400
 
-    current_target_zone = zone
-    fsm_state = FSM_MOVING
-    is_busy = True
+    print("[Pi] WAYBILL ZONE =", zone)
+    send_to_arduino(f"{zone}\n".encode())
 
-    send_to_arduino(b"FWD\n")
+    return jsonify({"status": "ok", "sent": zone})
 
-    return jsonify({"status": "ok", "target": zone})
 
-@app.route("/unload_number", methods=["POST"])
-def unload_number():
-    global fsm_state, current_target_zone
-
+@app.route("/marker", methods=["POST"])
+def marker():
     data = request.json if request.is_json else {}
     num = data.get("num")
 
     try:
         num = int(num)
-    except:
+    except Exception:
         return jsonify({"status": "error"}), 400
 
-    print("[Pi] Marker:", num, " target:", current_target_zone, " state:", fsm_state)
+    print("[Pi] MARKER =", num)
+    send_to_arduino(f"MARKER {num}\n".encode())
 
-    if fsm_state == FSM_MOVING and num == current_target_zone:
-        send_to_arduino(b"STOP\n")
+    return jsonify({"status": "ok", "sent": num})
 
-        if num < 400:
-            send_to_arduino(b"UNLOAD_L\n")
-        else:
-            send_to_arduino(b"UNLOAD_R\n")
-
-        fsm_state = FSM_UNLOADING
-
-    elif fsm_state == FSM_RETURNING and num == 100:
-        send_to_arduino(b"STOP\n")
-        send_to_arduino(b"HOME\n")
-
-    return jsonify({"status": "ok"})
 
 # ===========================================================
-#                     MAIN
+# MAIN
 # ===========================================================
 if __name__ == "__main__":
     print("===================================")
-    print("     Pi Simple FSM Server          ")
+    print("         Pi Server Running         ")
     print("===================================")
-
-    start_usb_thread()
 
     try:
         app.run(host="0.0.0.0", port=5000, threaded=True)
     finally:
         usb_thread_running = False
-        arduino_reader_running = False
         time.sleep(0.3)
 
         try:
             picam2.stop()
-        except:
+        except Exception:
             pass
 
         if ser:
             try:
                 ser.close()
-            except:
+            except Exception:
                 pass
