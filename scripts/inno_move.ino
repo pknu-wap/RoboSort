@@ -16,7 +16,9 @@ int ENB = 11;
 int IN3 = 12;
 int IN4 = 13;
 
-int v = 50;  // 속도
+int v = 105;  // 속도
+int m = 2500; // 시간 
+int s = 87; //각도
 
 void setup()
 {
@@ -35,8 +37,8 @@ void setup()
 
   stopAll();
 
-  servo1.write(90);
-  servo2.write(90);
+  servo1.write(s);
+  servo2.write(s);
 
   Serial.println("RoboSort Ready!");
 }
@@ -57,15 +59,15 @@ void loop()
     }
     else if (boxNumStr.startsWith("200"))
     {
-      moveForward(2000);
+      moveForward(m);
       tiltLeft();
-      moveBackward(2000);
+      moveBackward(m);
     }
     else if (boxNumStr.startsWith("300"))
     {
-      moveForward(4000);
+      moveForward(2*m);
       tiltLeft();
-      moveBackward(4000);
+      moveBackward(2*m);
     }
     else if (boxNumStr.startsWith("400"))
     {
@@ -73,15 +75,15 @@ void loop()
     }
     else if (boxNumStr.startsWith("500"))
     {
-      moveForward(2000);
+      moveForward(m);
       tiltRight();
-      moveBackward(2000);
+      moveBackward(m);
     }
     else if (boxNumStr.startsWith("600"))
     {
-      moveForward(4000);
+      moveForward(2*m);
       tiltRight();
-      moveBackward(4000);
+      moveBackward(2*m);
     }
     else
     {
@@ -159,24 +161,26 @@ void moveBackward(int duration)
   stopAll();
 }
 
-void tiltLeft()
-{
-  servo1.write(120);
-  servo2.write(60);
-  delay(2000);
-
-  servo1.write(90);
-  servo2.write(90);
-  delay(500);
-}
-
 void tiltRight()
 {
-  servo1.write(60);
-  servo2.write(120);
+  servo1.write(s+30);
+  servo2.write(s-30);
   delay(2000);
 
-  servo1.write(90);
-  servo2.write(90);
-  delay(500);
+  servo1.write(s);               
+  servo2.write(s);
+
+  delay(1000);
+}
+
+void tiltLeft()
+{
+  servo1.write(s - 20);
+  servo2.write(s + 20);
+  delay(2000);
+
+  servo1.write(s);
+  servo2.write(s);
+
+  delay(1000);
 }
