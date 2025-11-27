@@ -10,7 +10,7 @@ import serial.tools.list_ports as list_ports
 
 
 class SerialSender:
-    """ 아두이노로 '세 자리 코드(예: 900, 500, 600...)' 전송 """
+    """ 아두이노로 '세 자리 코드(예: 100, 500, 600...)' 전송 """
     def __init__(self, port: Optional[str], baud: int, dup_policy: str = "handshake", disable_serial: bool = False):
         self.port_name = find_serial_port(port)
         self.baud = baud
